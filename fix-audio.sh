@@ -56,11 +56,14 @@ DESCRIPTION:
     calls by forcing Bluetooth profile reset from HFP back to A2DP.
 
 OPTIONS:
-    -h, --help      Show this help message
-    -v, --version   Show version information
-    -d, --debug     Enable debug output
-    --dry-run       Show what would be done without executing
-    --status        Show current device status
+    -h, --help          Show this help message
+    -v, --version       Show version information
+    -d, --debug         Enable debug output
+    --dry-run           Show what would be done without executing
+    --status            Show current device status
+    --discover          Discover all Bluetooth devices
+    --find-plantronics  Find Plantronics devices automatically
+    --device MAC        Use specific device MAC address
 
 EXAMPLES:
     $SCRIPT_NAME                    # Fix audio quality
@@ -77,16 +80,136 @@ DEPENDENCIES:
 EOF
 }
 
-# Check if device is connected
-check_device_connected() {
-    local output
-    if ! command -v BluetoothConnector >/dev/null 2>&1; then
-        log_error "BluetoothConnector not found. Install with: brew install bluetoothconnector"
-        return 1
+# Discover all paired Bluetooth devices
+discover_bluetooth_devices() {
+    log_info "=== Bluetooth Device Discovery ==="
+    
+    # Method 1: Using system_profiler
+    if command -v system_profiler >/dev/null 2>&1; then
+        log_info "Paired Bluetooth devices (system_profiler):"
+        system_profiler SPBluetoothDataType 2>/dev/null | grep -E "(Address|Name):" | grep -A1 -B1 "Address:" || {
+            log_warn "No devices found via system_profiler"
+        }
+        echo
     fi
     
-    output=$(BluetoothConnector --status "$DEVICE_MAC" 2>/dev/null) || return 1
-    [[ $output == *"connected"* ]]
+    # Method 2: Using BluetoothConnector discovery
+    if command -v BluetoothConnector >/dev/null 2>&1; then
+        log_info "Discovering devices via BluetoothConnector:"
+        # List all paired devices - this might not be supported by all versions
+        local bt_output
+        bt_output=$(BluetoothConnector --list 2>/dev/null) || {
+            log_debug "BluetoothConnector --list not supported or failed"
+        }
+        if [[ -n "$bt_output" ]]; then
+            echo "$bt_output"
+        else
+            log_debug "BluetoothConnector discovery yielded no results"
+        fi
+        echo
+    fi
+    
+    # Method 3: Using audio-devices if available
+    if command -v audio-devices >/dev/null 2>&1; then
+        log_info "Audio devices (including Bluetooth):"
+        audio-devices list 2>/dev/null | grep -i bluetooth || {
+            log_debug "No Bluetooth audio devices found via audio-devices"
+        }
+        echo
+    fi
+}
+
+# Find Plantronics devices automatically
+find_plantronics_devices() {
+    local devices=()
+    
+    log_debug "Searching for Plantronics devices..."
+    
+    # Search in system profiler output
+    if command -v system_profiler >/dev/null 2>&1; then
+        local profiler_output
+        profiler_output=$(system_profiler SPBluetoothDataType 2>/dev/null)
+        
+        # Look for Plantronics device names and MAC addresses
+        while IFS= read -r line; do
+            if [[ $line =~ PLT_|Plantronics|BackBeat|BBTPRO ]]; then
+                log_debug "Found potential Plantronics device: $line"
+                # Try to extract MAC address from the context
+                local mac_context
+                mac_context=$(echo "$profiler_output" | grep -A 10 -B 10 "$line" | grep "Address:" | head -1)
+                if [[ $mac_context =~ ([0-9A-Fa-f]{2}:[0-9A-Fa-f]{2}:[0-9A-Fa-f]{2}:[0-9A-Fa-f]{2}:[0-9A-Fa-f]{2}:[0-9A-Fa-f]{2}) ]]; then
+                    devices+=("${BASH_REMATCH[1]}:$line")
+                fi
+            fi
+        done <<< "$profiler_output"
+    fi
+    
+    if [[ ${#devices[@]} -gt 0 ]]; then
+        log_info "Found Plantronics devices:"
+        printf '  %s\n' "${devices[@]}"
+        return 0
+    else
+        log_warn "No Plantronics devices found automatically"
+        return 1
+    fi
+}
+
+# Enhanced device connection check with multiple methods
+check_device_connected() {
+    local mac_address="${1:-$DEVICE_MAC}"
+    local method_used=""
+    
+    log_debug "Checking connection status for device: $mac_address"
+    
+    # Method 1: BluetoothConnector (primary)
+    if command -v BluetoothConnector >/dev/null 2>&1; then
+        local bt_output
+        bt_output=$(BluetoothConnector --status "$mac_address" 2>&1)
+        local bt_exit_code=$?
+        
+        log_debug "BluetoothConnector --status output: '$bt_output'"
+        log_debug "BluetoothConnector exit code: $bt_exit_code"
+        
+        if [[ $bt_exit_code -eq 0 ]]; then
+            # Check various possible connection indicators in the output
+            if [[ $bt_output =~ (connected|Connected|CONNECTED) ]] || 
+               [[ $bt_output =~ (status:.*true|Status:.*true) ]] ||
+               [[ $bt_output =~ (true) ]]; then
+                method_used="BluetoothConnector"
+                log_debug "Device connected (detected via $method_used)"
+                return 0
+            fi
+        fi
+    fi
+    
+    # Method 2: system_profiler fallback
+    if command -v system_profiler >/dev/null 2>&1; then
+        local profiler_output
+        profiler_output=$(system_profiler SPBluetoothDataType 2>/dev/null)
+        
+        # Look for the device and check if it shows as connected
+        if echo "$profiler_output" | grep -A 15 "$mac_address" | grep -q -i "connected.*yes\|state.*connected"; then
+            method_used="system_profiler"
+            log_debug "Device connected (detected via $method_used)"
+            return 0
+        fi
+    fi
+    
+    # Method 3: audio-devices fallback (for audio connectivity specifically)
+    if command -v audio-devices >/dev/null 2>&1; then
+        local audio_output
+        audio_output=$(audio-devices list 2>/dev/null)
+        
+        # Check if a Bluetooth device matching our target is available as audio output
+        if echo "$audio_output" | grep -i bluetooth | grep -q -i "PLT\|Plantronics\|BackBeat"; then
+            method_used="audio-devices"
+            log_debug "Device appears to be available for audio (detected via $method_used)"
+            return 0
+        fi
+    fi
+    
+    log_debug "Device not detected as connected by any method"
+    return 1
 }
 
 # Disconnect the device
@@ -248,32 +371,53 @@ fix_audio_quality() {
     return 1
 }
 
-# Show device status
+# Show device status with enhanced diagnostics
 show_device_status() {
     log_info "=== Device Status ==="
+    log_info "Target: $DEVICE_NAME ($DEVICE_MAC)"
+    echo
     
-    if check_device_connected; then
-        log_success "Device is connected"
+    # Check connection with detailed feedback
+    if check_device_connected "$DEVICE_MAC"; then
+        log_success "✅ Device is connected and detected"
     else
-        log_warn "Device is not connected"
+        log_warn "⚠️  Device connection not detected"
+        echo
+        log_info "Running device discovery to help diagnose..."
+        discover_bluetooth_devices
+        find_plantronics_devices
     fi
     
     # Show detailed device info if available
     if command -v system_profiler >/dev/null 2>&1; then
         echo
-        log_info "Bluetooth device information:"
-        system_profiler SPBluetoothDataType | grep -A 15 "$DEVICE_NAME" || {
-            log_warn "Device not found in system profiler output"
-        }
+        log_info "Bluetooth device information for $DEVICE_MAC:"
+        local device_info
+        device_info=$(system_profiler SPBluetoothDataType | grep -A 15 "$DEVICE_MAC")
+        if [[ -n "$device_info" ]]; then
+            echo "$device_info"
+        else
+            log_warn "Device $DEVICE_MAC not found in system profiler output"
+            echo
+            log_info "All paired devices:"
+            system_profiler SPBluetoothDataType | grep -E "(Name|Address):" | head -20
+        fi
     fi
     
     # Show audio device info if available
     if command -v audio-devices >/dev/null 2>&1; then
         echo
         log_info "Audio device information:"
-        audio-devices list | grep -i bluetooth || {
+        local audio_devices_output
+        audio_devices_output=$(audio-devices list 2>/dev/null)
+        if echo "$audio_devices_output" | grep -q -i bluetooth; then
+            echo "$audio_devices_output" | grep -i bluetooth
+        else
             log_warn "No Bluetooth audio devices found"
-        }
+            echo
+            log_info "All audio devices:"
+            echo "$audio_devices_output" | head -10
+        fi
     fi
 }
 
@@ -299,6 +443,30 @@ parse_arguments() {
                 show_device_status
                 exit 0
                 ;;
+            --discover)
+                discover_bluetooth_devices
+                exit 0
+                ;;
+            --find-plantronics)
+                find_plantronics_devices
+                exit 0
+                ;;
+            --device)
+                shift
+                if [[ -z "$1" ]]; then
+                    log_error "--device requires a MAC address argument"
+                    exit 1
+                fi
+                # Validate MAC address format
+                if [[ ! "$1" =~ ^([0-9A-Fa-f]{2}[:-]){5}([0-9A-Fa-f]{2})$ ]]; then
+                    log_error "Invalid MAC address format: $1"
+                    log_info "Expected format: XX:XX:XX:XX:XX:XX or XX-XX-XX-XX-XX-XX"
+                    exit 1
+                fi
+                # Override the default device MAC
+                DEVICE_MAC="$1"
+                log_info "Using custom device MAC: $DEVICE_MAC"
+                ;;
             *)
                 log_error "Unknown option: $1"
                 show_help >&2
@@ -316,16 +484,36 @@ show_dry_run_preview() {
 
 Target Device: $DEVICE_NAME ($DEVICE_MAC)
 
+EOF
+    
+    # Show current device status in dry-run
+    log_info "Current device detection status:"
+    if check_device_connected "$DEVICE_MAC"; then
+        log_success "✅ Device is currently connected and detected"
+    else
+        log_warn "⚠️  Device is not currently detected as connected"
+        echo
+        log_info "Would attempt device discovery and retry detection..."
+    fi
+    
+    cat << EOF
+
 Would execute the following steps:
-1. Check device connection status
+1. Check device connection status using multiple detection methods
 2. Disconnect Bluetooth device using BluetoothConnector
 3. Wait $DISCONNECT_WAIT seconds for clean disconnection
 4. Reconnect Bluetooth device
 5. Wait $VERIFY_WAIT seconds for profile establishment
-6. Verify A2DP profile restoration
+6. Verify A2DP profile restoration using multiple verification methods
 
 No actual changes will be made in dry-run mode.
 Run without --dry-run to execute the fix.
+
+Diagnostic commands you can run:
+  $SCRIPT_NAME --status           # Show detailed device status
+  $SCRIPT_NAME --discover         # Discover all Bluetooth devices
+  $SCRIPT_NAME --find-plantronics # Find Plantronics devices automatically
+  $SCRIPT_NAME --debug --dry-run  # Show debug information
 
 EOF
 }

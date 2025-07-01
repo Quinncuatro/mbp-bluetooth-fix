@@ -163,7 +163,7 @@ find_connected_plantronics() {
     
     # Look for PLT_BBTPRO in the Connected section
     local connected_section
-    connected_section=$(echo "$profiler_output" | sed -n '/Connected:/,/Not Connected:/p' | head -n -1)
+    connected_section=$(echo "$profiler_output" | sed -n '/Connected:/,/Not Connected:/p' | sed '$d')
     
     if echo "$connected_section" | grep -q "PLT_BBTPRO\|Plantronics\|BackBeat"; then
         # Extract the MAC address from the connected PLT_BBTPRO section
@@ -214,7 +214,10 @@ find_plantronics_devices() {
     if [[ ${#devices[@]} -gt 0 ]]; then
         log_info "Found Plantronics devices:"
         for device in "${devices[@]}"; do
-            IFS=':' read -r mac name status <<< "$device"
+            # Handle the colon-separated format properly
+            local mac=$(echo "$device" | cut -d':' -f1-6)
+            local name=$(echo "$device" | cut -d':' -f7)
+            local status=$(echo "$device" | cut -d':' -f8)
             printf '  %s (%s) - %s\n' "$mac" "$name" "$status"
         done
         return 0
@@ -238,7 +241,7 @@ check_device_connected() {
         
         # Check if the MAC address appears in the Connected section
         local connected_section
-        connected_section=$(echo "$profiler_output" | sed -n '/Connected:/,/Not Connected:/p' | head -n -1)
+        connected_section=$(echo "$profiler_output" | sed -n '/Connected:/,/Not Connected:/p' | sed '$d')
         
         if echo "$connected_section" | grep -q "$mac_address"; then
             method_used="system_profiler (MAC in Connected section)"

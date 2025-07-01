@@ -119,6 +119,66 @@ discover_bluetooth_devices() {
     fi
 }
 
+# Convert MAC address to different formats for BluetoothConnector compatibility
+convert_mac_format() {
+    local mac="$1"
+    local format="$2"
+    
+    # Remove any existing separators
+    local clean_mac=$(echo "$mac" | tr -d ':-')
+    
+    case "$format" in
+        "colon-lower")
+            echo "$clean_mac" | sed 's/../&:/g' | sed 's/:$//' | tr '[:upper:]' '[:lower:]'
+            ;;
+        "colon-upper")
+            echo "$clean_mac" | sed 's/../&:/g' | sed 's/:$//' | tr '[:lower:]' '[:upper:]'
+            ;;
+        "dash-lower")
+            echo "$clean_mac" | sed 's/../&-/g' | sed 's/-$//' | tr '[:upper:]' '[:lower:]'
+            ;;
+        "dash-upper")
+            echo "$clean_mac" | sed 's/../&-/g' | sed 's/-$//' | tr '[:lower:]' '[:upper:]'
+            ;;
+        "none-lower")
+            echo "$clean_mac" | tr '[:upper:]' '[:lower:]'
+            ;;
+        "none-upper")
+            echo "$clean_mac" | tr '[:lower:]' '[:upper:]'
+            ;;
+        *)
+            echo "$mac"  # Return original if unknown format
+            ;;
+    esac
+}
+
+# Find connected Plantronics device from system_profiler
+find_connected_plantronics() {
+    if ! command -v system_profiler >/dev/null 2>&1; then
+        return 1
+    fi
+    
+    local profiler_output
+    profiler_output=$(system_profiler SPBluetoothDataType 2>/dev/null)
+    
+    # Look for PLT_BBTPRO in the Connected section
+    local connected_section
+    connected_section=$(echo "$profiler_output" | sed -n '/Connected:/,/Not Connected:/p' | head -n -1)
+    
+    if echo "$connected_section" | grep -q "PLT_BBTPRO\|Plantronics\|BackBeat"; then
+        # Extract the MAC address from the connected PLT_BBTPRO section
+        local device_section
+        device_section=$(echo "$connected_section" | sed -n '/PLT_BBTPRO:/,/[A-Z].*:/p' | head -n -1)
+        
+        if [[ $device_section =~ Address:\ ([0-9A-Fa-f]{2}:[0-9A-Fa-f]{2}:[0-9A-Fa-f]{2}:[0-9A-Fa-f]{2}:[0-9A-Fa-f]{2}:[0-9A-Fa-f]{2}) ]]; then
+            echo "${BASH_REMATCH[1]}"
+            return 0
+        fi
+    fi
+    
+    return 1
+}
+
 # Find Plantronics devices automatically
 find_plantronics_devices() {
     local devices=()
@@ -130,15 +190,22 @@ find_plantronics_devices() {
         local profiler_output
         profiler_output=$(system_profiler SPBluetoothDataType 2>/dev/null)
         
-        # Look for Plantronics device names and MAC addresses
+        # Look for Plantronics device names and MAC addresses in both Connected and Not Connected sections
         while IFS= read -r line; do
             if [[ $line =~ PLT_|Plantronics|BackBeat|BBTPRO ]]; then
                 log_debug "Found potential Plantronics device: $line"
-                # Try to extract MAC address from the context
+                # Try to extract MAC address from the context - look more broadly
                 local mac_context
-                mac_context=$(echo "$profiler_output" | grep -A 10 -B 10 "$line" | grep "Address:" | head -1)
+                mac_context=$(echo "$profiler_output" | grep -A 20 -B 5 "$line" | grep "Address:" | head -1)
                 if [[ $mac_context =~ ([0-9A-Fa-f]{2}:[0-9A-Fa-f]{2}:[0-9A-Fa-f]{2}:[0-9A-Fa-f]{2}:[0-9A-Fa-f]{2}:[0-9A-Fa-f]{2}) ]]; then
-                    devices+=("${BASH_REMATCH[1]}:$line")
+                    # Check if this device is connected
+                    local connection_status="Unknown"
+                    if echo "$profiler_output" | sed -n '/Connected:/,/Not Connected:/p' | grep -q "$line"; then
+                        connection_status="Connected"
+                    elif echo "$profiler_output" | sed -n '/Not Connected:/,$p' | grep -q "$line"; then
+                        connection_status="Not Connected"
+                    fi
+                    devices+=("${BASH_REMATCH[1]}:$line:$connection_status")
                 fi
             fi
         done <<< "$profiler_output"
@@ -146,7 +213,10 @@ find_plantronics_devices() {
     
     if [[ ${#devices[@]} -gt 0 ]]; then
         log_info "Found Plantronics devices:"
-        printf '  %s\n' "${devices[@]}"
+        for device in "${devices[@]}"; do
+            IFS=':' read -r mac name status <<< "$device"
+            printf '  %s (%s) - %s\n' "$mac" "$name" "$status"
+        done
         return 0
     else
         log_warn "No Plantronics devices found automatically"
@@ -161,38 +231,56 @@ check_device_connected() {
     
     log_debug "Checking connection status for device: $mac_address"
     
-    # Method 1: BluetoothConnector (primary)
-    if command -v BluetoothConnector >/dev/null 2>&1; then
-        local bt_output
-        bt_output=$(BluetoothConnector --status "$mac_address" 2>&1)
-        local bt_exit_code=$?
-        
-        log_debug "BluetoothConnector --status output: '$bt_output'"
-        log_debug "BluetoothConnector exit code: $bt_exit_code"
-        
-        if [[ $bt_exit_code -eq 0 ]]; then
-            # Check various possible connection indicators in the output
-            if [[ $bt_output =~ (connected|Connected|CONNECTED) ]] || 
-               [[ $bt_output =~ (status:.*true|Status:.*true) ]] ||
-               [[ $bt_output =~ (true) ]]; then
-                method_used="BluetoothConnector"
-                log_debug "Device connected (detected via $method_used)"
-                return 0
-            fi
-        fi
-    fi
-    
-    # Method 2: system_profiler fallback
+    # Method 1: Check if device is in Connected section of system_profiler (most reliable)
     if command -v system_profiler >/dev/null 2>&1; then
         local profiler_output
         profiler_output=$(system_profiler SPBluetoothDataType 2>/dev/null)
         
-        # Look for the device and check if it shows as connected
-        if echo "$profiler_output" | grep -A 15 "$mac_address" | grep -q -i "connected.*yes\|state.*connected"; then
-            method_used="system_profiler"
+        # Check if the MAC address appears in the Connected section
+        local connected_section
+        connected_section=$(echo "$profiler_output" | sed -n '/Connected:/,/Not Connected:/p' | head -n -1)
+        
+        if echo "$connected_section" | grep -q "$mac_address"; then
+            method_used="system_profiler (MAC in Connected section)"
             log_debug "Device connected (detected via $method_used)"
             return 0
         fi
+        
+        # Alternative: Check by device name in Connected section
+        if echo "$connected_section" | grep -q "PLT_BBTPRO\|Plantronics\|BackBeat"; then
+            method_used="system_profiler (device name in Connected section)"
+            log_debug "Device connected (detected via $method_used)"
+            return 0
+        fi
+    fi
+    
+    # Method 2: BluetoothConnector with multiple MAC formats
+    if command -v BluetoothConnector >/dev/null 2>&1; then
+        local formats=("colon-lower" "colon-upper" "dash-lower" "dash-upper" "none-lower" "none-upper")
+        
+        for format in "${formats[@]}"; do
+            local converted_mac
+            converted_mac=$(convert_mac_format "$mac_address" "$format")
+            log_debug "Trying BluetoothConnector with MAC format '$format': $converted_mac"
+            
+            local bt_output
+            bt_output=$(BluetoothConnector --status "$converted_mac" 2>&1)
+            local bt_exit_code=$?
+            
+            log_debug "BluetoothConnector --status '$converted_mac' output: '$bt_output'"
+            log_debug "BluetoothConnector exit code: $bt_exit_code"
+            
+            if [[ $bt_exit_code -eq 0 ]]; then
+                # Check various possible connection indicators in the output
+                if [[ $bt_output =~ (connected|Connected|CONNECTED) ]] || 
+                   [[ $bt_output =~ (status:.*true|Status:.*true) ]] ||
+                   [[ $bt_output =~ (true) ]]; then
+                    method_used="BluetoothConnector (format: $format)"
+                    log_debug "Device connected (detected via $method_used)"
+                    return 0
+                fi
+            fi
+        done
     fi
     
     # Method 3: audio-devices fallback (for audio connectivity specifically)
@@ -200,9 +288,9 @@ check_device_connected() {
         local audio_output
         audio_output=$(audio-devices list 2>/dev/null)
         
-        # Check if a Bluetooth device matching our target is available as audio output
-        if echo "$audio_output" | grep -i bluetooth | grep -q -i "PLT\|Plantronics\|BackBeat"; then
-            method_used="audio-devices"
+        # Check if PLT_BBTPRO is available as an output device
+        if echo "$audio_output" | grep -q "PLT_BBTPRO"; then
+            method_used="audio-devices (PLT_BBTPRO found in output devices)"
             log_debug "Device appears to be available for audio (detected via $method_used)"
             return 0
         fi
@@ -212,12 +300,55 @@ check_device_connected() {
     return 1
 }
 
+# Find the working MAC format for BluetoothConnector
+find_working_mac_format() {
+    local mac_address="${1:-$DEVICE_MAC}"
+    
+    if ! command -v BluetoothConnector >/dev/null 2>&1; then
+        return 1
+    fi
+    
+    local formats=("colon-lower" "colon-upper" "dash-lower" "dash-upper" "none-lower" "none-upper")
+    
+    for format in "${formats[@]}"; do
+        local converted_mac
+        converted_mac=$(convert_mac_format "$mac_address" "$format")
+        
+        # Test if this format works by running a status check
+        local bt_output
+        bt_output=$(BluetoothConnector --status "$converted_mac" 2>&1)
+        local bt_exit_code=$?
+        
+        # If we get a valid response (not an "Invalid MAC address" error), this format works
+        if [[ $bt_exit_code -eq 0 ]] || [[ ! $bt_output =~ "Invalid MAC address" ]]; then
+            log_debug "Found working MAC format '$format' for BluetoothConnector: $converted_mac"
+            echo "$converted_mac"
+            return 0
+        fi
+    done
+    
+    log_debug "No working MAC format found for BluetoothConnector"
+    return 1
+}
+
 # Disconnect the device
 disconnect_device() {
+    local mac_address="${1:-$DEVICE_MAC}"
     local output
     log_info "Disconnecting Bluetooth device..."
     
-    output=$(BluetoothConnector --disconnect "$DEVICE_MAC" 2>&1)
+    # Try to find the correct MAC format for BluetoothConnector
+    local working_mac
+    working_mac=$(find_working_mac_format "$mac_address")
+    
+    if [[ -z "$working_mac" ]]; then
+        log_error "Could not find a working MAC address format for BluetoothConnector"
+        return 1
+    fi
+    
+    log_debug "Using MAC format for disconnect: $working_mac"
+    
+    output=$(BluetoothConnector --disconnect "$working_mac" 2>&1)
     local exit_code=$?
     
     if [[ $exit_code -ne 0 ]]; then
@@ -231,10 +362,22 @@ disconnect_device() {
 
 # Reconnect the device
 reconnect_device() {
+    local mac_address="${1:-$DEVICE_MAC}"
     local output
     log_info "Reconnecting device..."
     
-    output=$(BluetoothConnector --connect "$DEVICE_MAC" --notify 2>&1)
+    # Try to find the correct MAC format for BluetoothConnector
+    local working_mac
+    working_mac=$(find_working_mac_format "$mac_address")
+    
+    if [[ -z "$working_mac" ]]; then
+        log_error "Could not find a working MAC address format for BluetoothConnector"
+        return 1
+    fi
+    
+    log_debug "Using MAC format for reconnect: $working_mac"
+    
+    output=$(BluetoothConnector --connect "$working_mac" --notify 2>&1)
     local exit_code=$?
     
     if [[ $exit_code -ne 0 ]]; then
@@ -518,6 +661,24 @@ Diagnostic commands you can run:
 EOF
 }
 
+# Auto-detect connected Plantronics device and update DEVICE_MAC
+auto_detect_device() {
+    local connected_mac
+    connected_mac=$(find_connected_plantronics)
+    
+    if [[ -n "$connected_mac" ]]; then
+        log_info "Auto-detected connected Plantronics device: $connected_mac"
+        if [[ "$connected_mac" != "$DEVICE_MAC" ]]; then
+            log_info "Updating target device from $DEVICE_MAC to $connected_mac"
+            DEVICE_MAC="$connected_mac"
+        fi
+        return 0
+    else
+        log_debug "No connected Plantronics device found via auto-detection"
+        return 1
+    fi
+}
+
 # Main execution function
 main() {
     parse_arguments "$@"
@@ -526,6 +687,12 @@ main() {
     if [[ "${DEBUG:-0}" == "1" ]]; then
         set -x  # Enable command tracing
         log_debug "Debug mode enabled"
+    fi
+    
+    # Try to auto-detect connected device if using default MAC
+    if [[ "$DEVICE_MAC" == "0C:E0:E4:86:0B:06" ]]; then
+        log_debug "Using default MAC address, attempting auto-detection..."
+        auto_detect_device || log_debug "Auto-detection failed, using default MAC"
     fi
     
     # Show header
